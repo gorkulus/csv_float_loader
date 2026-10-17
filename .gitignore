@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local data / scratch (don't commit CV takes or test media)
+*.csv
+*.latent
+*.mp4
+*.webm
+*.png
+*.jpg
