@@ -402,6 +402,46 @@ class GrowBlurMaskByFloats(io.ComfyNode):
         return io.NodeOutput(out)
 
 
+# ---------------------------------------------------------------------------
+# New node: bridge a monolithic FLOATS list to ACN's native FLOAT list
+#
+# Advanced-ControlNet's "Latent Keyframe From List" (and friends) expose
+# float_strengths as a "FLOAT" input flagged INPUT_IS_LIST -- it expects
+# ComfyUI's native per-item list mechanism, NOT the single "FLOATS" object
+# that this pack (and Yvann / VHS) ship on one link. This node unpacks a
+# FLOATS list into a native FLOAT output list (is_output_list) so the two
+# list conventions interoperate. Pure pass-through of the values.
+# ---------------------------------------------------------------------------
+
+
+class FloatsToStrengthList(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="CSVFloatLoader_FloatsToStrengthList",
+            display_name="CV FLOATS \u2192 Strength List (ACN)",
+            category="csv/float",
+            description=(
+                "Converts a monolithic FLOATS list into ComfyUI's native "
+                "per-item FLOAT output list, so it can feed Advanced-ControlNet "
+                "nodes whose float_strengths input expects a FLOAT list "
+                "(INPUT_IS_LIST), e.g. 'Latent Keyframe From List'. Only the "
+                "list-passing convention changes; values pass through unmodified."
+            ),
+            inputs=[
+                Floats.Input("floats", tooltip="Per-frame FLOATS list to unpack."),
+            ],
+            outputs=[
+                io.Float.Output(display_name="float_strengths", is_output_list=True),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, floats) -> io.NodeOutput:
+        out = [float(v) for v in (floats if floats is not None else [])]
+        return io.NodeOutput(out)
+
+
 class CSVFloatLoaderExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
@@ -409,6 +449,7 @@ class CSVFloatLoaderExtension(ComfyExtension):
             CSVColumnFloats,
             FloatsRemap,
             GrowBlurMaskByFloats,
+            FloatsToStrengthList,
         ]
 
 
