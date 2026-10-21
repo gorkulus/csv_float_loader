@@ -403,14 +403,22 @@ class GrowBlurMaskByFloats(io.ComfyNode):
 
 
 # ---------------------------------------------------------------------------
-# New node: bridge a monolithic FLOATS list to ACN's native FLOAT list
+# New node: bridge a FLOATS list onto ACN's "FLOAT" float_strengths input
 #
-# Advanced-ControlNet's "Latent Keyframe From List" (and friends) expose
-# float_strengths as a "FLOAT" input flagged INPUT_IS_LIST -- it expects
-# ComfyUI's native per-item list mechanism, NOT the single "FLOATS" object
-# that this pack (and Yvann / VHS) ship on one link. This node unpacks a
-# FLOATS list into a native FLOAT output list (is_output_list) so the two
-# list conventions interoperate. Pure pass-through of the values.
+# Advanced-ControlNet's "Latent Keyframe From List" / "Timestep Keyframe From
+# List" expose float_strengths as a plain "FLOAT" force_input. In this (V3)
+# version of ACN those nodes are NOT declared INPUT_IS_LIST; their execute
+# instead inspects the single incoming value and iterates it when it is an
+# Iterable (isinstance(float_strengths, Iterable)). So the whole per-frame
+# list must arrive as ONE object on that FLOAT socket.
+#
+# Therefore this bridge outputs is_output_list=False and passes the entire
+# list through as a single value. Emitting a native per-item output list
+# (is_output_list=True) instead triggers ComfyUI per-item expansion: the
+# keyframe node -- and the ControlNet loader/apply downstream -- would run
+# once PER FRAME, loading the ControlNet N times and exhausting VRAM. The
+# only thing this node changes is the FLOATS->FLOAT type label; values pass
+# through unmodified.
 # ---------------------------------------------------------------------------
 
 
@@ -422,17 +430,19 @@ class FloatsToStrengthList(io.ComfyNode):
             display_name="CV FLOATS \u2192 Strength List (ACN)",
             category="csv/float",
             description=(
-                "Converts a monolithic FLOATS list into ComfyUI's native "
-                "per-item FLOAT output list, so it can feed Advanced-ControlNet "
-                "nodes whose float_strengths input expects a FLOAT list "
-                "(INPUT_IS_LIST), e.g. 'Latent Keyframe From List'. Only the "
-                "list-passing convention changes; values pass through unmodified."
+                "Re-labels a FLOATS list onto a plain FLOAT socket so it can "
+                "feed Advanced-ControlNet nodes whose float_strengths input is "
+                "a FLOAT force_input, e.g. 'Latent Keyframe From List'. The "
+                "whole list is delivered as ONE object (NOT a per-item output "
+                "list), which is what those nodes iterate; emitting a per-item "
+                "list would make ComfyUI run the ControlNet loader once per "
+                "frame. Values pass through unmodified."
             ),
             inputs=[
-                Floats.Input("floats", tooltip="Per-frame FLOATS list to unpack."),
+                Floats.Input("floats", tooltip="Per-frame FLOATS list to pass through."),
             ],
             outputs=[
-                io.Float.Output(display_name="float_strengths", is_output_list=True),
+                io.Float.Output(display_name="float_strengths", is_output_list=False),
             ],
         )
 
