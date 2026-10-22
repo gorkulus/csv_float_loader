@@ -345,6 +345,11 @@ class GrowBlurMaskByFloats(io.ComfyNode):
                                tooltip="Constant blur sigma added to blur modulation."),
                 io.Float.Input("blur_gain", default=1.0, min=-1.0e6, max=1.0e6, step=0.01,
                                tooltip="Multiplier on blur_floats before adding to base_blur."),
+                io.Boolean.Input("use_gpu", default=False,
+                                 tooltip="Run grow/blur on CUDA when the mask is on CPU. Much "
+                                         "faster for large blur radii, but results match the CPU "
+                                         "path only to within floating-point (~1e-6), so a pinned "
+                                         "seed may not reproduce bit-for-bit. Off = exact CPU."),
             ],
             outputs=[io.Mask.Output(display_name="mask")],
         )
@@ -357,47 +362,97 @@ class GrowBlurMaskByFloats(io.ComfyNode):
 
     @classmethod
     def execute(cls, mask, base_grow, grow_gain, base_blur, blur_gain,
-                grow_floats=None, blur_floats=None) -> io.NodeOutput:
+                grow_floats=None, blur_floats=None, use_gpu=False) -> io.NodeOutput:
+        # Vectorized replacement for the original per-frame Python loop. Three
+        # things made the loop slow: (1) one Python/tensor round-trip per frame,
+        # (2) a square k*k max_pool for grow (O(k^2) per pixel), and (3) a fresh
+        # Gaussian kernel rebuilt every frame. This version processes frames in
+        # batched chunks, does grow as two separable 1-D max-pools (O(k)), and
+        # blurs a whole chunk in ONE grouped conv (one kernel per frame). The
+        # math is the same as before: grow is exact (max is separable), and each
+        # blur kernel is built on a shared width but zeroed beyond its own radius
+        # and renormalized, so it equals the per-frame kernel. (On CUDA, conv may
+        # differ from CPU at ~1e-6 -- see the use_gpu tooltip.)
         import torch
         import torch.nn.functional as F
+        from collections import defaultdict
 
         m = mask
         if m.dim() == 2:
             m = m.unsqueeze(0)
         b, h, w = m.shape[0], m.shape[-2], m.shape[-1]
-
-        def grow(x, px):  # x [1,1,H,W]
-            if px == 0:
-                return x
-            k = 2 * abs(px) + 1
-            pad = abs(px)
-            if px > 0:
-                return F.max_pool2d(x, kernel_size=k, stride=1, padding=pad)
-            return 1.0 - F.max_pool2d(1.0 - x, kernel_size=k, stride=1, padding=pad)
-
-        def blur(x, sigma):  # x [1,1,H,W]
-            if sigma <= 0:
-                return x
-            radius = max(1, int(round(sigma * 3)))
-            radius = min(radius, max(1, min(h, w) - 1))
-            xs = torch.arange(-radius, radius + 1, dtype=x.dtype, device=x.device)
-            k1d = torch.exp(-(xs ** 2) / (2.0 * sigma * sigma))
-            k1d = k1d / k1d.sum()
-            kx = k1d.view(1, 1, 1, -1)
-            ky = k1d.view(1, 1, -1, 1)
-            x = F.pad(x, (radius, radius, radius, radius), mode="replicate")
-            x = F.conv2d(x, kx)
-            x = F.conv2d(x, ky)
-            return x
-
         out = torch.empty_like(m)
-        for i in range(b):
-            frame = m[i].unsqueeze(0).unsqueeze(0).float()
-            g = int(round(base_grow + grow_gain * cls._at(grow_floats, i)))
-            s = max(0.0, base_blur + blur_gain * cls._at(blur_floats, i))
-            frame = grow(frame, g)
-            frame = blur(frame, s)
-            out[i] = frame[0, 0].clamp(0.0, 1.0).to(out.dtype)
+
+        max_radius = max(1, min(h, w) - 1)
+
+        # Per-frame parameters -- identical formulas to the scalar reference.
+        gs = [int(round(base_grow + grow_gain * cls._at(grow_floats, i))) for i in range(b)]
+        ss = [max(0.0, base_blur + blur_gain * cls._at(blur_floats, i)) for i in range(b)]
+        rr = [0 if s <= 0 else min(max(1, int(round(s * 3))), max_radius) for s in ss]
+
+        # No grow and no blur anywhere -> just the reference's final clamp.
+        if all(g == 0 for g in gs) and all(r == 0 for r in rr):
+            return io.NodeOutput(m.clamp(0.0, 1.0))
+
+        dev = m.device
+        if use_gpu and dev.type == "cpu" and torch.cuda.is_available():
+            dev = torch.device("cuda")
+
+        def grow_group(xb, gs_local):
+            # xb: [n,1,H,W] float. Dilate (g>0) / erode (g<0) each frame by its
+            # integer px, batching frames that share px into one separable pass.
+            gb = torch.empty_like(xb)
+            groups = defaultdict(list)
+            for j, g in enumerate(gs_local):
+                groups[g].append(j)
+            for g, locs in groups.items():
+                sub = xb[locs]
+                if g != 0:
+                    px = abs(g)
+                    k = 2 * px + 1
+                    if g > 0:
+                        sub = F.max_pool2d(sub, (1, k), stride=1, padding=(0, px))
+                        sub = F.max_pool2d(sub, (k, 1), stride=1, padding=(px, 0))
+                    else:
+                        inv = 1.0 - sub
+                        inv = F.max_pool2d(inv, (1, k), stride=1, padding=(0, px))
+                        inv = F.max_pool2d(inv, (k, 1), stride=1, padding=(px, 0))
+                        sub = 1.0 - inv
+                gb[locs] = sub
+            return gb
+
+        def blur_group(gb, ss_local, rr_local):
+            # gb: [n,1,H,W] float. Gaussian-blur each frame by its own sigma in
+            # one grouped separable conv -- one kernel per frame (channel).
+            n = gb.shape[0]
+            R = max(rr_local)
+            if R == 0:
+                return gb
+            xs = torch.arange(-R, R + 1, device=dev, dtype=torch.float32)
+            bank = torch.zeros(n, 2 * R + 1, device=dev, dtype=torch.float32)
+            for j in range(n):
+                r = rr_local[j]
+                if r == 0:
+                    bank[j, R] = 1.0  # delta -> passes the frame through unchanged
+                else:
+                    s = ss_local[j]
+                    kk = torch.exp(-(xs * xs) / (2.0 * s * s))
+                    kk = torch.where(xs.abs() <= r, kk, torch.zeros_like(kk))
+                    bank[j] = kk / kk.sum()
+            x = gb.transpose(0, 1)  # [1,n,H,W]
+            x = F.pad(x, (R, R, 0, 0), mode="replicate")
+            x = F.conv2d(x, bank.view(n, 1, 1, 2 * R + 1), groups=n)
+            x = F.pad(x, (0, 0, R, R), mode="replicate")
+            x = F.conv2d(x, bank.view(n, 1, 2 * R + 1, 1), groups=n)
+            return x.transpose(0, 1)  # [n,1,H,W]
+
+        CHUNK = 8
+        for start in range(0, b, CHUNK):
+            end = min(start + CHUNK, b)
+            xb = m[start:end].to(device=dev, dtype=torch.float32).unsqueeze(1)
+            gb = grow_group(xb, gs[start:end])
+            bb = blur_group(gb, ss[start:end], rr[start:end])
+            out[start:end] = bb.squeeze(1).clamp(0.0, 1.0).to(dtype=out.dtype, device=out.device)
 
         return io.NodeOutput(out)
 
