@@ -6,6 +6,8 @@ The author reports use on Windows and Linux with recent ComfyUI versions; this
 is not a version-by-version compatibility guarantee. Models and workflow inputs
 are not bundled, and not every graph is guaranteed to reproduce.
 
+Built with Comfy Agent.
+
 ## Install
 
 Requires an existing ComfyUI installation with the V3 API (`comfy_api.latest`)
