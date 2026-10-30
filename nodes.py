@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 import csv
 import os
 
@@ -45,7 +46,7 @@ def _load_rows(csv_path: str) -> list[list[str]]:
 
 
 def _looks_like_header(row: list[str]) -> bool:
-    """A row is a header if none of its first cells parse as a float."""
+    """Check only the first nonblank cell among the first 16: text means header."""
     for cell in row[:16]:
         cell = (cell or "").strip()
         if cell == "":
@@ -75,7 +76,7 @@ def _data_rows(csv_path: str, has_header: bool) -> list[list[str]]:
 def _slice_like_vhs(rows, skip_first_frames, frame_load_cap, select_every_nth):
     """Mirror VideoHelperSuite's Load Video frame selection ORDER:
     skip first N, then take every Nth, then cap the count.
-    This keeps a per-column CV list frame-aligned with a video loaded by VHS.
+    Alignment also requires matching source rows and video timing; no resampling.
     """
     if skip_first_frames and skip_first_frames > 0:
         rows = rows[skip_first_frames:]
@@ -132,12 +133,12 @@ class CSVFloatLoader(io.ComfyNode):
                     min=0,
                     max=0xFFFFFFFF,
                     step=1,
-                    tooltip="Which data row to output (0-based). Header row is skipped automatically if present.",
+                    tooltip="Which data row to output (0-based), after optional header detection.",
                 ),
                 io.Boolean.Input(
                     "has_header",
                     default=True,
-                    tooltip="If true, auto-detect and skip a non-numeric header row.",
+                    tooltip="Check the first row's first nonblank cell within 16 columns; skip the row if that cell is nonnumeric.",
                 ),
                 io.Float.Input(
                     "default_value",
@@ -182,13 +183,13 @@ class CSVColumnFloats(io.ComfyNode):
             description=(
                 "Reads ONE column of a CSV as a per-frame FLOATS list (one value "
                 "per data row). The skip/cap/every-nth controls mirror VHS Load "
-                "Video's frame selection so the CV stays aligned with the video."
+                "Video's selection order; alignment requires matching rows and timing."
             ),
             inputs=[
                 io.String.Input(
                     "csv_path",
-                    default="take-0002.csv",
-                    tooltip="CSV file: absolute path, or a name relative to ComfyUI's input/ folder.",
+                    default="",
+                    tooltip="Enter a CSV path: checked as supplied (absolute or relative to the process working directory), then relative to ComfyUI's input/ folder.",
                 ),
                 io.Int.Input(
                     "column",
@@ -201,7 +202,7 @@ class CSVColumnFloats(io.ComfyNode):
                 io.Boolean.Input(
                     "has_header",
                     default=True,
-                    tooltip="If true, auto-detect and skip a non-numeric header row.",
+                    tooltip="Check the first row's first nonblank cell within 16 columns; skip the row if that cell is nonnumeric.",
                 ),
                 io.Int.Input(
                     "skip_first_frames",
@@ -346,10 +347,9 @@ class GrowBlurMaskByFloats(io.ComfyNode):
                 io.Float.Input("blur_gain", default=1.0, min=-1.0e6, max=1.0e6, step=0.01,
                                tooltip="Multiplier on blur_floats before adding to base_blur."),
                 io.Boolean.Input("use_gpu", default=False,
-                                 tooltip="Run grow/blur on CUDA when the mask is on CPU. Much "
-                                         "faster for large blur radii, but results match the CPU "
-                                         "path only to within floating-point (~1e-6), so a pinned "
-                                         "seed may not reproduce bit-for-bit. Off = exact CPU."),
+                                 tooltip="Allow CPU masks to compute on CUDA when available. "
+                                         "Off keeps computation on the input device. Output returns "
+                                         "to the original device/dtype; CPU/CUDA equivalence is not guaranteed."),
             ],
             outputs=[io.Mask.Output(display_name="mask")],
         )
@@ -371,8 +371,8 @@ class GrowBlurMaskByFloats(io.ComfyNode):
         # blurs a whole chunk in ONE grouped conv (one kernel per frame). The
         # math is the same as before: grow is exact (max is separable), and each
         # blur kernel is built on a shared width but zeroed beyond its own radius
-        # and renormalized, so it equals the per-frame kernel. (On CUDA, conv may
-        # differ from CPU at ~1e-6 -- see the use_gpu tooltip.)
+        # and renormalized, so it equals the per-frame kernel mathematically.
+        # CPU/CUDA numerical equivalence is not guaranteed.
         import torch
         import torch.nn.functional as F
         from collections import defaultdict
@@ -461,8 +461,8 @@ class GrowBlurMaskByFloats(io.ComfyNode):
 # New node: bridge a FLOATS list onto ACN's "FLOAT" float_strengths input
 #
 # Advanced-ControlNet's "Latent Keyframe From List" / "Timestep Keyframe From
-# List" expose float_strengths as a plain "FLOAT" force_input. In this (V3)
-# version of ACN those nodes are NOT declared INPUT_IS_LIST; their execute
+# List" expose float_strengths as a plain "FLOAT" force_input. Compatible
+# ACN versions do NOT declare these nodes INPUT_IS_LIST; their implementation
 # instead inspects the single incoming value and iterates it when it is an
 # Iterable (isinstance(float_strengths, Iterable)). So the whole per-frame
 # list must arrive as ONE object on that FLOAT socket.
@@ -470,10 +470,9 @@ class GrowBlurMaskByFloats(io.ComfyNode):
 # Therefore this bridge outputs is_output_list=False and passes the entire
 # list through as a single value. Emitting a native per-item output list
 # (is_output_list=True) instead triggers ComfyUI per-item expansion: the
-# keyframe node -- and the ControlNet loader/apply downstream -- would run
-# once PER FRAME, loading the ControlNet N times and exhausting VRAM. The
-# only thing this node changes is the FLOATS->FLOAT type label; values pass
-# through unmodified.
+# keyframe node and downstream consumers may run once PER FRAME, increasing
+# work and potentially memory use depending on the graph. This bridge changes
+# the FLOATS->FLOAT type label and converts each value with float().
 # ---------------------------------------------------------------------------
 
 
@@ -489,9 +488,8 @@ class FloatsToStrengthList(io.ComfyNode):
                 "feed Advanced-ControlNet nodes whose float_strengths input is "
                 "a FLOAT force_input, e.g. 'Latent Keyframe From List'. The "
                 "whole list is delivered as ONE object (NOT a per-item output "
-                "list), which is what those nodes iterate; emitting a per-item "
-                "list would make ComfyUI run the ControlNet loader once per "
-                "frame. Values pass through unmodified."
+                "list), which is what those nodes iterate. Not for scalar-only "
+                "FLOAT consumers. Each value is converted with float()."
             ),
             inputs=[
                 Floats.Input("floats", tooltip="Per-frame FLOATS list to pass through."),
